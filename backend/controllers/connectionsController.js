@@ -25,12 +25,27 @@ const {
 const { detectSentiment, rebuildIssuesFromFeedback } = require('../lib/issueAggregator');
 const { classifyFeedbackEvents } = require('../lib/groqFeedbackClassifier');
 const { insertFeedbackEventsDeduped } = require('../lib/feedbackDedup');
+const { isDemoUser } = require('../lib/demoMode');
+const { buildDemoGmailFeedbackRows, wait } = require('../lib/demoFixtures');
 const { extractLocation } = require('../services/locationService');
 const { ensureUserRecords } = require('../lib/ensureUserRecords');
-const { runAgent } = require('../services/agentService');
 const { ensureCalendarAccessToken } = require('../services/calendarService');
+const { runAgent } = require('../services/agentService');
+const { QUEUE_NAMES } = require('../services/jobQueueService');
+const { publishSystemEvent } = require('../services/liveEventsService');
 
-const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+const APP_URL = String(process.env.APP_URL || 'http://localhost:3000')
+  .trim()
+  .replace(/\/+$/, '');
+const GMAIL_PREVIEW_LIMIT = 40;
+const GMAIL_DETAIL_LIMIT = 20;
+const OUTLOOK_DETAIL_LIMIT = 8;
+
+function getSettledValues(results) {
+  return results
+    .filter((result) => result.status === 'fulfilled')
+    .map((result) => result.value);
+}
 
 function sanitizeConnectionMetadata(provider, metadata = {}) {
   if (provider !== 'imap') {
@@ -271,6 +286,16 @@ async function gmailOAuthCallback(req, res) {
     const profile = await fetchGoogleProfile(tokens.access_token);
 
     await upsertGoogleWorkspaceConnections(oauthState.userId, profile, tokens);
+    await publishSystemEvent({
+      userId: oauthState.userId,
+      type: 'repo_connected',
+      queueName: QUEUE_NAMES.REALTIME,
+      priority: 'normal',
+      payload: {
+        provider: 'gmail',
+        email: profile.email,
+      },
+    }).catch(() => null);
 
     return res.redirect(
       `${oauthState.redirectTo}?gmail=connected&message=${encodeURIComponent(
@@ -324,6 +349,16 @@ async function outlookOAuthCallback(req, res) {
         lastSyncedAt: null,
       },
     });
+    await publishSystemEvent({
+      userId: oauthState.userId,
+      type: 'repo_connected',
+      queueName: QUEUE_NAMES.REALTIME,
+      priority: 'normal',
+      payload: {
+        provider: 'outlook',
+        email,
+      },
+    }).catch(() => null);
 
     return res.redirect(
       `${oauthState.redirectTo}?outlook=connected&message=${encodeURIComponent(
@@ -364,6 +399,16 @@ async function googleCalendarOAuthCallback(req, res) {
     const profile = await fetchGoogleProfile(tokens.access_token);
 
     await upsertGoogleWorkspaceConnections(oauthState.userId, profile, tokens);
+    await publishSystemEvent({
+      userId: oauthState.userId,
+      type: 'repo_connected',
+      queueName: QUEUE_NAMES.REALTIME,
+      priority: 'normal',
+      payload: {
+        provider: 'google_calendar',
+        email: profile.email,
+      },
+    }).catch(() => null);
 
     return res.redirect(
       `${oauthState.redirectTo}?success=calendar`
@@ -400,6 +445,11 @@ async function connectProvider(req, res) {
 
 async function syncConnection(req, res) {
   try {
+    console.log('Sync started', {
+      provider: req.params?.provider || null,
+      userId: req.user?.id || null,
+      demoMode: isDemoUser(req.user),
+    });
     const requestedProvider = req.params.provider;
     const provider =
       requestedProvider === 'google-calendar'
@@ -461,6 +511,14 @@ async function syncConnection(req, res) {
     };
 
     if (provider === 'gmail') {
+      if (isDemoUser(req.user)) {
+        console.log('Using hybrid demo Gmail payload');
+        await wait(1100);
+        rows = buildDemoGmailFeedbackRows({
+          userId: req.user.id,
+          accountEmail: connection.metadata?.email || req.user.email || null,
+        });
+      } else {
       let accessToken = connection.access_token;
 
       if (connection.refresh_token) {
@@ -480,75 +538,80 @@ async function syncConnection(req, res) {
       }
 
       const messages = await listRecentMessages(accessToken);
-      const previews = [];
+      const previewTargets = messages.slice(0, GMAIL_PREVIEW_LIMIT);
+      const previews = getSettledValues(
+        await Promise.allSettled(
+          previewTargets.map((message) => getMessagePreview(accessToken, message.id))
+        )
+      );
 
-      for (const message of messages.slice(0, 40)) {
-        const preview = await getMessagePreview(accessToken, message.id);
-        previews.push(preview);
+      if (previews.length === 0) {
+        const lastSyncedAt = new Date().toISOString();
+        const nextMetadata = {
+          ...(connection.metadata || {}),
+          lastSyncedAt,
+          syncedCount: 0,
+          skippedCount: messages.length,
+          duplicatesSkipped: 0,
+        };
+
+        await supabase
+          .from('connected_accounts')
+          .update({
+            metadata: nextMetadata,
+            last_synced_at: lastSyncedAt,
+            status: 'connected',
+            last_error: null,
+            ...updatePayload,
+          })
+          .eq('id', connection.id);
+
+        return res.json({
+          success: true,
+          provider,
+          fetched: messages.length,
+          imported: 0,
+          skipped: messages.length,
+          duplicatesSkipped: 0,
+          lastSyncedAt,
+        });
       }
 
-      const classifications = await classifyFeedbackEvents(previews, {
+      filteredOut = Math.max(0, messages.length - previews.length);
+      rows = previews.slice(0, GMAIL_DETAIL_LIMIT).map((preview) => ({
+        user_id: req.user.id,
         source: 'gmail',
-        userId: req.user.id,
-      });
-      const classificationById = new Map(
-        classifications.map((classification) => [classification.externalId, classification])
-      );
-      const shortlistedPreviews = previews.filter(
-        (preview) => classificationById.get(preview.externalId)?.include
-      );
-      const details = [];
-
-      for (const preview of shortlistedPreviews.slice(0, 12)) {
-        const detail = await getMessageDetail(accessToken, preview.externalId);
-        details.push(detail);
-      }
-
-      filteredOut = previews.length - details.length;
-
-      rows = details.flatMap((detail) => {
-        const classification = classificationById.get(detail.externalId);
-
-        if (!classification?.include) {
-          return [];
-        }
-
-        return [
-          {
-            user_id: req.user.id,
-            source: 'gmail',
-            external_id: detail.externalId,
-            title: detail.title,
-            body: detail.body,
-            author: detail.author,
-            url: detail.url,
-            occurred_at: detail.occurredAt,
-            sentiment: classification.sentiment || detectSentiment(`${detail.title} ${detail.body}`),
-            replied: false,
-            location: extractLocation({
-              source: 'gmail',
-              title: detail.title,
-              body: detail.body,
-              author: detail.author,
-              metadata: {
-                accountEmail: connection.metadata?.email || null,
-              },
-            }),
-            metadata: {
-              threadId: detail.threadId,
-              senderEmail: detail.senderEmail,
-              senderName: detail.senderName,
-              originalSubject: detail.title,
-              messageIdHeader: detail.messageIdHeader,
-              classificationReason: classification.reason,
-              groqSentiment: classification.sentiment || 'neutral',
-              isProductFeedback: true,
-            },
+        external_id: preview.externalId,
+        title: preview.title,
+        body: preview.snippet || preview.title || 'Gmail feedback',
+        author: preview.author,
+        occurred_at: preview.occurredAt,
+        sentiment: detectSentiment(`${preview.title} ${preview.snippet || ''}`),
+        replied: false,
+        location: extractLocation({
+          source: 'gmail',
+          title: preview.title,
+          body: preview.snippet || '',
+          author: preview.author,
+          metadata: {
+            accountEmail: connection.metadata?.email || null,
           },
-        ];
-      });
+        }),
+        metadata: {
+          threadId: preview.threadId || null,
+          senderEmail: preview.senderEmail || null,
+          senderName: preview.senderName || null,
+          originalSubject: preview.title,
+          messageIdHeader: null,
+          classificationReason: 'preview-ingest',
+          groqSentiment: 'neutral',
+          isProductFeedback: true,
+          fallbackIngest: true,
+        },
+      }));
 
       updatePayload.access_token = accessToken;
+      }
     } else if (provider === 'outlook') {
       let accessToken = connection.access_token;
 
@@ -580,12 +643,13 @@ async function syncConnection(req, res) {
       const shortlistedPreviews = previews.filter(
         (preview) => classificationById.get(preview.externalId)?.include
       );
-      const details = [];
-
-      for (const preview of shortlistedPreviews.slice(0, 12)) {
-        const detail = await getOutlookMessageDetail(accessToken, preview.externalId);
-        details.push(detail);
-      }
+      const details = getSettledValues(
+        await Promise.allSettled(
+          shortlistedPreviews
+            .slice(0, OUTLOOK_DETAIL_LIMIT)
+            .map((preview) => getOutlookMessageDetail(accessToken, preview.externalId))
+        )
+      );
 
       filteredOut = previews.length - details.length;
 
@@ -744,12 +808,17 @@ async function syncConnection(req, res) {
           })
         : { fetched: 0, inserted: 0, duplicatesSkipped: 0 };
     duplicatesSkipped = insertResult.duplicatesSkipped;
+    let workflowResult = { issues: [] };
 
     if (rows.length > 0 && insertResult.inserted > 0) {
-      await rebuildIssuesFromFeedback(req.user.id);
+      console.log('Feedback inserted:', insertResult.inserted);
+      console.log('Triggering workflow');
+      workflowResult = await rebuildIssuesFromFeedback(req.user.id);
       await runAgent(req.user, {
         newFeedbackRows: insertResult.rows,
       });
+      console.log('Workflow completed');
+      console.log('Issues created:', workflowResult?.issues?.length || 0);
     }
 
     const lastSyncedAt = new Date().toISOString();
@@ -774,8 +843,12 @@ async function syncConnection(req, res) {
     res.json({
       success: true,
       provider,
+      demoMode: provider === 'gmail' && isDemoUser(req.user),
       fetched: rows.length,
       imported: insertResult.inserted,
+      feedbackCount: insertResult.inserted,
+      result: workflowResult,
+      issues: Array.isArray(workflowResult?.issues) ? workflowResult.issues : [],
       skipped: filteredOut + duplicatesSkipped,
       duplicatesSkipped,
       lastSyncedAt,
